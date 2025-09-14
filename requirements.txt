@@ -1,6 +1,5 @@
 Flask
 Flask-Login
-oauthlib
-requests_oauthlib
+requests
 yfinance
-gunicorn
+Werkzeug
