@@ -5,9 +5,12 @@ import time
 import logging
 import json
 import threading
+import asyncio
+import queue
 from flask import Flask, redirect, url_for, render_template_string, request, session, jsonify
 from flask_login import LoginManager, UserMixin, login_user, logout_user, login_required, current_user
-# Werkzeug is a dependency of Flask and is automatically installed. No need to import explicitly.
+import discord
+from discord.ext import commands
 
 # --- Setup Logging ---
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
@@ -22,7 +25,7 @@ FINNHUB_API_KEY = os.environ.get("FINNHUB_API_KEY")
 
 if not all([DISCORD_CLIENT_ID, DISCORD_CLIENT_SECRET, DISCORD_REDIRECT_URI, DISCORD_BOT_TOKEN]):
     logger.error("❌ กรุณาตั้งค่า DISCORD_CLIENT_ID, DISCORD_CLIENT_SECRET, DISCORD_REDIRECT_URI และ DISCORD_BOT_TOKEN ใน Environment Variables ให้ครบถ้วน")
-    
+
 # --- Flask App Setup ---
 app = Flask(__name__)
 app.config['SECRET_KEY'] = os.urandom(24)
@@ -335,6 +338,9 @@ def api_delete_target():
         return jsonify(success=False, message="❌ ไม่พบเป้าหมายที่คุณตั้งไว้"), 404
 
 # --- Stock Check and Discord Notify Logic ---
+# A message queue to pass messages from the stock checker thread to the bot thread.
+notification_queue = queue.Queue()
+
 def fetch_price_blocking(symbol: str):
     try:
         ticker = yf.Ticker(symbol)
@@ -346,18 +352,6 @@ def fetch_price_blocking(symbol: str):
         logger.warning(f"ไม่สามารถดึงราคาหุ้น {symbol}: {e}")
         return None
 
-def send_discord_webhook(webhook_url: str, message: str):
-    """Sends a message to a Discord channel via webhook."""
-    payload = {
-        "content": message
-    }
-    try:
-        response = requests.post(webhook_url, json=payload)
-        if response.status_code != 204: # 204 No Content is a success status for webhooks
-            logger.error(f"Failed to send Discord webhook: {response.status_code} - {response.text}")
-    except Exception as e:
-        logger.error(f"Error sending Discord webhook: {e}")
-
 def run_stock_checker():
     while True:
         logger.info("เริ่มตรวจสอบราคาหุ้น...")
@@ -366,12 +360,6 @@ def run_stock_checker():
         for user_id_str, user_data in all_users_data.items():
             user_id = int(user_id_str)
             targets_to_check = list(user_data.get('targets', {}).items())
-            
-            # Here we'd need a way to get the webhook URL for each user, 
-            # which is not available through the Discord OAuth2 flow.
-            # For a simpler solution, we can use a fixed webhook URL.
-            # Example: DISCORD_WEBHOOK_URL = os.environ.get("DISCORD_WEBHOOK_URL")
-            # For this code, we'll re-implement the DM send logic with a fixed bot.
             
             for symbol, data in targets_to_check:
                 target = data.get('target')
@@ -392,41 +380,43 @@ def run_stock_checker():
                               f"ราคาปัจจุบัน: {current_price} บาท\n" \
                               f"ราคาเป้าหมาย: {target} บาท"
                     
-                    try:
-                        # Re-implementing the DM send logic using a stable bot setup
-                        # This requires the bot to be constantly online and have appropriate intents
-                        # For a simple solution, we'll revert to the previous approach and fix it.
-                        
-                        import asyncio
-                        
-                        # New and improved Discord bot logic for sending DMs
-                        async def send_dm_once():
-                            bot = discord.Client(intents=discord.Intents.default())
-                            @bot.event
-                            async def on_ready():
-                                try:
-                                    user = await bot.fetch_user(user_id)
-                                    if user:
-                                        await user.send(message)
-                                        logger.info(f"Notification sent to Discord user {user.name} ({user_id})")
-                                except Exception as e:
-                                    logger.error(f"Error sending DM to user {user_id}: {e}")
-                                finally:
-                                    await bot.close()
-                            
-                            await bot.start(DISCORD_BOT_TOKEN)
-                        
-                        threading.Thread(target=lambda: asyncio.run(send_dm_once())).start()
-
-                    except Exception as e:
-                        logger.error(f"An error occurred during Discord notification: {e}")
-        
+                    # Pass the message and user ID to the bot via the queue
+                    notification_queue.put({'user_id': user_id, 'message': message})
+                    
         time.sleep(60) # Changed to 60 seconds (1 minute)
+
+# New function to run the Discord bot in a separate thread
+def run_discord_bot():
+    intents = discord.Intents.default()
+    bot = commands.Bot(command_prefix="!", intents=intents)
+
+    @bot.event
+    async def on_ready():
+        logger.info(f'Logged in as {bot.user} (ID: {bot.user.id})')
+        while True:
+            try:
+                # Check the queue for new messages without blocking
+                if not notification_queue.empty():
+                    notification = notification_queue.get_nowait()
+                    user_id = notification['user_id']
+                    message = notification['message']
+                    
+                    user = await bot.fetch_user(user_id)
+                    if user:
+                        await user.send(message)
+                        logger.info(f"Notification sent to Discord user {user.name} ({user_id})")
+            except Exception as e:
+                logger.error(f"Error handling notification from queue: {e}")
+            
+            await asyncio.sleep(1) # Wait 1 second before checking the queue again
+
+    bot.run(DISCORD_BOT_TOKEN)
 
 # --- Main Entry Point ---
 if __name__ == "__main__":
-    # Start the stock checker in a separate thread
+    # Start both the stock checker and the Discord bot in separate threads
     Thread(target=run_stock_checker, daemon=True).start()
+    Thread(target=run_discord_bot, daemon=True).start()
     
     # Run the web server
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 8000)))
