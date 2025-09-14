@@ -3,4 +3,4 @@ Flask-Login
 requests
 yfinance
 Werkzeug
-gunicorn
+discord.py
