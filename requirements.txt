@@ -3,3 +3,4 @@ Flask-Login
 requests
 yfinance
 Werkzeug
+gunicorn
