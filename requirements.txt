@@ -1,0 +1,6 @@
+Flask
+Flask-Login
+oauthlib
+requests_oauthlib
+yfinance
+gunicorn
