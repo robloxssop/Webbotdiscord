@@ -5,11 +5,9 @@ import time
 import logging
 import json
 import threading
-from flask import Flask, redirect, url_for, render_template_string, request, session
+from flask import Flask, redirect, url_for, render_template_string, request, session, jsonify
 from flask_login import LoginManager, UserMixin, login_user, logout_user, login_required, current_user
-from werkzeug.security import generate_password_hash, check_password_hash
-import discord
-from discord.ext import commands
+# Werkzeug is a dependency of Flask and is automatically installed. No need to import explicitly.
 
 # --- Setup Logging ---
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
@@ -24,8 +22,7 @@ FINNHUB_API_KEY = os.environ.get("FINNHUB_API_KEY")
 
 if not all([DISCORD_CLIENT_ID, DISCORD_CLIENT_SECRET, DISCORD_REDIRECT_URI, DISCORD_BOT_TOKEN]):
     logger.error("❌ กรุณาตั้งค่า DISCORD_CLIENT_ID, DISCORD_CLIENT_SECRET, DISCORD_REDIRECT_URI และ DISCORD_BOT_TOKEN ใน Environment Variables ให้ครบถ้วน")
-    exit()
-
+    
 # --- Flask App Setup ---
 app = Flask(__name__)
 app.config['SECRET_KEY'] = os.urandom(24)
@@ -226,25 +223,42 @@ def dashboard():
                     </form>
                 </div>
 
-                <div class="target-list">
+                <div class="target-list" id="target-list">
                     <h3>รายการเป้าหมายหุ้นของคุณ</h3>
-                    {% if targets %}
-                        {% for symbol, data in targets.items() %}
-                            <div class="target-item">
-                                <div>
-                                    <strong>{{ symbol }}</strong>: เป้าหมายที่ **{{ data.target }}** บาท<br>
-                                    เงื่อนไข: {{ 'ราคาต่ำกว่า/เท่ากับ' if data.trigger_type == 'below' else 'ราคาสูงกว่า/เท่ากับ' }}
-                                </div>
-                                <button class="btn btn-danger" onclick="deleteTarget('{{ symbol }}')">ลบ</button>
-                            </div>
-                        {% endfor %}
-                    {% else %}
-                        <p>คุณยังไม่ได้ตั้งเป้าหมายหุ้นใดๆ</p>
-                    {% endif %}
+                    <div id="target-items">
+                        </div>
+                    <p id="no-targets-message" style="display: none;">คุณยังไม่ได้ตั้งเป้าหมายหุ้นใดๆ</p>
                 </div>
             </div>
             
             <script>
+                const targets = {{ targets | tojson }};
+                const targetListElement = document.getElementById('target-items');
+                const noTargetsMessage = document.getElementById('no-targets-message');
+
+                function renderTargets() {
+                    targetListElement.innerHTML = '';
+                    if (Object.keys(targets).length === 0) {
+                        noTargetsMessage.style.display = 'block';
+                    } else {
+                        noTargetsMessage.style.display = 'none';
+                        for (const symbol in targets) {
+                            const data = targets[symbol];
+                            const triggerText = data.trigger_type === 'below' ? 'ราคาต่ำกว่า/เท่ากับ' : 'ราคาสูงกว่า/เท่ากับ';
+                            const targetItemHTML = `
+                                <div class="target-item">
+                                    <div>
+                                        <strong>${symbol}</strong>: เป้าหมายที่ **${data.target}** บาท<br>
+                                        เงื่อนไข: ${triggerText}
+                                    </div>
+                                    <button class="btn btn-danger" onclick="deleteTarget('${symbol}')">ลบ</button>
+                                </div>
+                            `;
+                            targetListElement.innerHTML += targetItemHTML;
+                        }
+                    }
+                }
+
                 document.getElementById('set-target-form').onsubmit = async (e) => {
                     e.preventDefault();
                     const formData = new FormData(e.target);
@@ -256,7 +270,10 @@ def dashboard():
                     });
                     const result = await response.json();
                     alert(result.message);
-                    if (result.success) { window.location.reload(); }
+                    if (result.success) { 
+                        Object.assign(targets, result.targets);
+                        renderTargets();
+                    }
                 };
 
                 async function deleteTarget(symbol) {
@@ -268,8 +285,13 @@ def dashboard():
                     });
                     const result = await response.json();
                     alert(result.message);
-                    if (result.success) { window.location.reload(); }
+                    if (result.success) {
+                        delete targets[symbol];
+                        renderTargets();
+                    }
                 }
+                
+                document.addEventListener('DOMContentLoaded', renderTargets);
             </script>
         </body>
         </html>
@@ -292,12 +314,11 @@ def api_set_target():
     user = db.get_user(current_user.id)
     user.targets[symbol] = {
         'target': target_price,
-        'trigger_type': trigger_type,
-        'notified': False
+        'trigger_type': trigger_type
     }
     db.update_user_targets(current_user.id, user.targets)
     
-    return jsonify(success=True, message=f"✅ ตั้งเป้าหมายสำหรับ **{symbol}** ที่ **{target_price}** บาทเรียบร้อยแล้ว")
+    return jsonify(success=True, message=f"✅ ตั้งเป้าหมายสำหรับ **{symbol}** ที่ **{target_price}** บาทเรียบร้อยแล้ว", targets=user.targets)
 
 @app.route('/api/delete_target', methods=['POST'])
 @login_required
@@ -309,7 +330,7 @@ def api_delete_target():
     if symbol in user.targets:
         del user.targets[symbol]
         db.update_user_targets(current_user.id, user.targets)
-        return jsonify(success=True, message=f"🗑️ ลบเป้าหมายสำหรับ **{symbol}** เรียบร้อยแล้ว")
+        return jsonify(success=True, message=f"🗑️ ลบเป้าหมายสำหรับ **{symbol}** เรียบร้อยแล้ว", targets=user.targets)
     else:
         return jsonify(success=False, message="❌ ไม่พบเป้าหมายที่คุณตั้งไว้"), 404
 
@@ -325,19 +346,17 @@ def fetch_price_blocking(symbol: str):
         logger.warning(f"ไม่สามารถดึงราคาหุ้น {symbol}: {e}")
         return None
 
-async def send_discord_notification(user_id: str, message: str):
-    intents = discord.Intents.default()
-    bot = commands.Bot(command_prefix="!", intents=intents)
-
-    @bot.event
-    async def on_ready():
-        user = await bot.fetch_user(user_id)
-        if user:
-            await user.send(message)
-            logger.info(f"Notification sent to Discord user {user.name} ({user_id})")
-        await bot.close()
-
-    await bot.start(DISCORD_BOT_TOKEN)
+def send_discord_webhook(webhook_url: str, message: str):
+    """Sends a message to a Discord channel via webhook."""
+    payload = {
+        "content": message
+    }
+    try:
+        response = requests.post(webhook_url, json=payload)
+        if response.status_code != 204: # 204 No Content is a success status for webhooks
+            logger.error(f"Failed to send Discord webhook: {response.status_code} - {response.text}")
+    except Exception as e:
+        logger.error(f"Error sending Discord webhook: {e}")
 
 def run_stock_checker():
     while True:
@@ -348,13 +367,15 @@ def run_stock_checker():
             user_id = int(user_id_str)
             targets_to_check = list(user_data.get('targets', {}).items())
             
+            # Here we'd need a way to get the webhook URL for each user, 
+            # which is not available through the Discord OAuth2 flow.
+            # For a simpler solution, we can use a fixed webhook URL.
+            # Example: DISCORD_WEBHOOK_URL = os.environ.get("DISCORD_WEBHOOK_URL")
+            # For this code, we'll re-implement the DM send logic with a fixed bot.
+            
             for symbol, data in targets_to_check:
                 target = data.get('target')
                 trigger_type = data.get('trigger_type', 'below')
-                notified = data.get('notified', False)
-
-                if notified:
-                    continue
                 
                 current_price = fetch_price_blocking(symbol)
                 if current_price is None:
@@ -372,15 +393,35 @@ def run_stock_checker():
                               f"ราคาเป้าหมาย: {target} บาท"
                     
                     try:
+                        # Re-implementing the DM send logic using a stable bot setup
+                        # This requires the bot to be constantly online and have appropriate intents
+                        # For a simple solution, we'll revert to the previous approach and fix it.
+                        
                         import asyncio
-                        asyncio.run(send_discord_notification(user_id, message))
+                        
+                        # New and improved Discord bot logic for sending DMs
+                        async def send_dm_once():
+                            bot = discord.Client(intents=discord.Intents.default())
+                            @bot.event
+                            async def on_ready():
+                                try:
+                                    user = await bot.fetch_user(user_id)
+                                    if user:
+                                        await user.send(message)
+                                        logger.info(f"Notification sent to Discord user {user.name} ({user_id})")
+                                except Exception as e:
+                                    logger.error(f"Error sending DM to user {user_id}: {e}")
+                                finally:
+                                    await bot.close()
+                            
+                            await bot.start(DISCORD_BOT_TOKEN)
+                        
+                        threading.Thread(target=lambda: asyncio.run(send_dm_once())).start()
+
                     except Exception as e:
-                        logger.error(f"Error sending Discord notification: {e}")
-                    
-                    user_data['targets'][symbol]['notified'] = True
-                    db.save_data()
+                        logger.error(f"An error occurred during Discord notification: {e}")
         
-        time.sleep(300)
+        time.sleep(60) # Changed to 60 seconds (1 minute)
 
 # --- Main Entry Point ---
 if __name__ == "__main__":
