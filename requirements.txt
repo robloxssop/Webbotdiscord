@@ -4,3 +4,4 @@ requests
 yfinance
 Werkzeug
 discord.py
+gunicorn
